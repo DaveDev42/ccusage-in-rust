@@ -111,6 +111,27 @@ pub(crate) fn discover_jsonl_files(bases: &[PathBuf]) -> Vec<DiscoveredFile> {
     out
 }
 
+/// Mirrors upstream `extractProjectFromPath`: find the segment immediately
+/// after `projects/` in the file path. Returns "unknown" if not found.
+pub(crate) fn extract_project_from_path(jsonl_path: &Path) -> String {
+    let segments: Vec<String> = jsonl_path
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    if let Some(idx) = segments.iter().position(|s| s == PROJECTS_DIR) {
+        if idx + 1 < segments.len() {
+            let name = &segments[idx + 1];
+            if !name.trim().is_empty() {
+                return name.clone();
+            }
+        }
+    }
+    "unknown".to_string()
+}
+
 /// Compute (sessionId, projectPath) for the session aggregator from a JSONL path within a base dir.
 ///
 /// Mirrors ccusage's relative-path arithmetic:

@@ -132,6 +132,8 @@ dependencies = [
  "clap",
  "comfy-table",
  "dirs",
+ "iana-time-zone",
+ "indexmap",
  "pretty_assertions",
  "rayon",
  "reqwest",

@@ -5,7 +5,9 @@
 
 use comfy_table::{Cell, ContentArrangement, Table};
 
-use crate::output::json::{BlockEntry, DailyEntry, MonthlyEntry, SessionEntry, Totals};
+use crate::output::json::{
+    BlockEntry, DailyEntry, MonthlyEntry, SessionByIdOutput, SessionEntry, Totals, WeeklyEntry,
+};
 
 fn money(v: f64) -> String {
     format!("${v:.2}")
@@ -108,6 +110,46 @@ pub(crate) fn print_monthly(rows: &[MonthlyEntry], totals: &Totals) {
     println!("{t}");
 }
 
+pub(crate) fn print_weekly(rows: &[WeeklyEntry], totals: &Totals) {
+    let mut t = Table::new();
+    header(
+        &mut t,
+        &[
+            "Week",
+            "Models",
+            "Input",
+            "Output",
+            "Cache Create",
+            "Cache Read",
+            "Total Tokens",
+            "Cost",
+        ],
+    );
+    for r in rows {
+        t.add_row(vec![
+            Cell::new(&r.week),
+            Cell::new(r.models_used.join(", ")),
+            Cell::new(nat(r.input_tokens)),
+            Cell::new(nat(r.output_tokens)),
+            Cell::new(nat(r.cache_creation_tokens)),
+            Cell::new(nat(r.cache_read_tokens)),
+            Cell::new(nat(r.total_tokens)),
+            Cell::new(money(r.total_cost)),
+        ]);
+    }
+    t.add_row(vec![
+        Cell::new("Total"),
+        Cell::new(""),
+        Cell::new(nat(totals.input_tokens)),
+        Cell::new(nat(totals.output_tokens)),
+        Cell::new(nat(totals.cache_creation_tokens)),
+        Cell::new(nat(totals.cache_read_tokens)),
+        Cell::new(nat(totals.total_tokens)),
+        Cell::new(money(totals.total_cost)),
+    ]);
+    println!("{t}");
+}
+
 pub(crate) fn print_session(rows: &[SessionEntry], totals: &Totals) {
     let mut t = Table::new();
     header(
@@ -171,6 +213,44 @@ pub(crate) fn print_blocks(rows: &[BlockEntry]) {
             Cell::new(r.models.join(", ")),
             Cell::new(nat(r.total_tokens)),
             Cell::new(money(r.cost_usd)),
+        ]);
+    }
+    println!("{t}");
+}
+
+pub(crate) fn print_session_by_id(out: &SessionByIdOutput) {
+    println!("Claude Code Session Usage - {}", out.session_id);
+    println!("Total Cost: {}", money(out.total_cost));
+    println!("Total Tokens: {}", nat(out.total_tokens));
+    println!("Total Entries: {}", out.entries.len());
+    println!();
+
+    if out.entries.is_empty() {
+        return;
+    }
+
+    let mut t = Table::new();
+    header(
+        &mut t,
+        &[
+            "Timestamp",
+            "Model",
+            "Input",
+            "Output",
+            "Cache Create",
+            "Cache Read",
+            "Cost (USD)",
+        ],
+    );
+    for e in &out.entries {
+        t.add_row(vec![
+            Cell::new(&e.timestamp),
+            Cell::new(&e.model),
+            Cell::new(nat(e.input_tokens)),
+            Cell::new(nat(e.output_tokens)),
+            Cell::new(nat(e.cache_creation_tokens)),
+            Cell::new(nat(e.cache_read_tokens)),
+            Cell::new(money(e.cost_usd)),
         ]);
     }
     println!("{t}");

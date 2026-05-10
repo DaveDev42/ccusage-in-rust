@@ -48,7 +48,7 @@ fn floor_to_hour(ts: DateTime<Utc>) -> DateTime<Utc> {
 
 pub(crate) fn build(opts: &LoadOptions) -> Result<BlocksOutput> {
     let loaded = load_all_events(opts)?;
-    let now = Utc::now();
+    let now = opts.now_override.unwrap_or_else(Utc::now);
     let session_dur = Duration::hours(BLOCK_DURATION_HOURS);
 
     let mut entries: Vec<InternalEntry> = loaded

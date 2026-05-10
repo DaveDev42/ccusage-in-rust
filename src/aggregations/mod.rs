@@ -4,13 +4,17 @@ pub(crate) mod blocks;
 pub(crate) mod daily;
 pub(crate) mod monthly;
 pub(crate) mod session;
+pub(crate) mod session_by_id;
+pub(crate) mod weekly;
 
 use std::collections::HashSet;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 
-use crate::discover::{DiscoveredFile, claude_paths, discover_jsonl_files};
+use crate::discover::{
+    DiscoveredFile, claude_paths, discover_jsonl_files, extract_project_from_path,
+};
 use crate::parse::{UsageEvent, parse_file};
 use crate::pricing::{CostMode, PricingFetcher};
 
@@ -28,6 +32,15 @@ pub(crate) struct LoadOptions {
     pub order: SortOrder,
     pub offline: bool,
     pub timezone: chrono_tz::Tz,
+    /// Filter to a specific project name (compared against `extractProjectFromPath`).
+    /// Mirrors upstream `--project` flag.
+    pub project: Option<String>,
+    /// Group daily entries by project (so each (date, project) is its own row).
+    /// Mirrors upstream `groupByProject` option set when `--instances` is passed.
+    pub group_by_project: bool,
+    /// Override "now" for active-block projection determinism. Set via `--now <ISO8601>`
+    /// or `CCUSAGE_RS_NOW`. When `None`, uses real wall-clock `Utc::now()`.
+    pub now_override: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Container for fully-loaded events with per-event cost already resolved.
@@ -39,12 +52,22 @@ pub(crate) struct LoadedEvents {
 pub(crate) struct EventWithCost {
     pub event: UsageEvent,
     pub cost: f64,
+    /// Project name extracted from the source file path (mirrors `extractProjectFromPath`).
+    pub project: String,
 }
 
 pub(crate) fn load_all_events(opts: &LoadOptions) -> Result<LoadedEvents> {
     let bases = claude_paths()?;
     let files = discover_jsonl_files(&bases);
     let files = sort_files_by_earliest_timestamp(files);
+    // Upstream applies `filterByProject` BEFORE per-line read, so we mirror that.
+    let files: Vec<DiscoveredFile> = match &opts.project {
+        Some(target) => files
+            .into_iter()
+            .filter(|f| &extract_project_from_path(&f.path) == target)
+            .collect(),
+        None => files,
+    };
 
     // Pricing fetcher only needed for non-display modes.
     let fetcher = if opts.mode == CostMode::Display {
@@ -64,7 +87,12 @@ pub(crate) fn load_all_events(opts: &LoadOptions) -> Result<LoadedEvents> {
         .into_iter()
         .map(|e| {
             let cost = compute_cost(&e, opts.mode, fetcher.as_ref());
-            EventWithCost { event: e, cost }
+            let project = extract_project_from_path(&e.source_file);
+            EventWithCost {
+                event: e,
+                cost,
+                project,
+            }
         })
         .collect();
 

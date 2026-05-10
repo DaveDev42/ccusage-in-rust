@@ -30,16 +30,23 @@ struct DayAgg {
 
 pub(crate) fn build(opts: &LoadOptions) -> Result<DailyOutput> {
     let loaded = load_all_events(opts)?;
+    // When --instances or --project is in effect, upstream groups by `${date}\x00${project}`.
+    let group_by_project = opts.group_by_project || opts.project.is_some();
     let mut by_day: BTreeMap<String, DayAgg> = BTreeMap::new();
     let mut day_order: Vec<String> = Vec::new();
 
     for ev in &loaded.events {
         let date = format_date_ymd(ev.event.timestamp, opts.timezone);
-        if !by_day.contains_key(&date) {
-            day_order.push(date.clone());
-            by_day.insert(date.clone(), DayAgg::default());
+        let key = if group_by_project {
+            format!("{date}\x00{}", ev.project)
+        } else {
+            date.clone()
+        };
+        if !by_day.contains_key(&key) {
+            day_order.push(key.clone());
+            by_day.insert(key.clone(), DayAgg::default());
         }
-        let day = by_day.get_mut(&date).unwrap();
+        let day = by_day.get_mut(&key).unwrap();
         day.input += ev.event.input_tokens;
         day.output += ev.event.output_tokens;
         day.cache_create += ev.event.cache_creation_input_tokens;
@@ -69,9 +76,17 @@ pub(crate) fn build(opts: &LoadOptions) -> Result<DailyOutput> {
     }
 
     let mut entries: Vec<DailyEntry> = Vec::new();
-    for date in &day_order {
-        let day = by_day.get(date).unwrap();
-        if !date_in_range(date, &opts.since, &opts.until) {
+    for key in &day_order {
+        let day = by_day.get(key).unwrap();
+        let (date, project) = if group_by_project {
+            let mut parts = key.splitn(2, '\0');
+            let d = parts.next().unwrap_or("").to_string();
+            let p = parts.next().map(|s| s.to_string());
+            (d, p)
+        } else {
+            (key.clone(), None)
+        };
+        if !date_in_range(&date, &opts.since, &opts.until) {
             continue;
         }
 
@@ -98,7 +113,7 @@ pub(crate) fn build(opts: &LoadOptions) -> Result<DailyOutput> {
 
         let total_tokens = day.input + day.output + day.cache_create + day.cache_read;
         entries.push(DailyEntry {
-            date: date.clone(),
+            date,
             input_tokens: day.input,
             output_tokens: day.output,
             cache_creation_tokens: day.cache_create,
@@ -107,6 +122,7 @@ pub(crate) fn build(opts: &LoadOptions) -> Result<DailyOutput> {
             total_cost: day.cost,
             models_used: day.model_order.clone(),
             model_breakdowns: breakdowns,
+            project,
         });
     }
 

@@ -51,6 +51,31 @@ pub(crate) struct DailyEntry {
     pub models_used: Vec<String>,
     #[serde(rename = "modelBreakdowns")]
     pub model_breakdowns: Vec<ModelBreakdown>,
+    /// Only present when `--instances` or `--project` was passed (so groupByProject was active).
+    /// Upstream omits this field entirely when null via the `...data.project != null && {project}` spread.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct WeeklyEntry {
+    pub week: String,
+    #[serde(rename = "inputTokens")]
+    pub input_tokens: u64,
+    #[serde(rename = "outputTokens")]
+    pub output_tokens: u64,
+    #[serde(rename = "cacheCreationTokens")]
+    pub cache_creation_tokens: u64,
+    #[serde(rename = "cacheReadTokens")]
+    pub cache_read_tokens: u64,
+    #[serde(rename = "totalTokens")]
+    pub total_tokens: u64,
+    #[serde(rename = "totalCost", serialize_with = "js_number")]
+    pub total_cost: f64,
+    #[serde(rename = "modelsUsed")]
+    pub models_used: Vec<String>,
+    #[serde(rename = "modelBreakdowns")]
+    pub model_breakdowns: Vec<ModelBreakdown>,
 }
 
 #[derive(Debug, Serialize)]
@@ -122,9 +147,47 @@ pub(crate) struct DailyOutput {
     pub totals: Totals,
 }
 
+/// Per-project entry inside the `--instances` JSON shape. Same fields as `DailyEntry`
+/// but without the `project` field (since it's the map key).
+#[derive(Debug, Serialize)]
+pub(crate) struct ProjectDailyEntry {
+    pub date: String,
+    #[serde(rename = "inputTokens")]
+    pub input_tokens: u64,
+    #[serde(rename = "outputTokens")]
+    pub output_tokens: u64,
+    #[serde(rename = "cacheCreationTokens")]
+    pub cache_creation_tokens: u64,
+    #[serde(rename = "cacheReadTokens")]
+    pub cache_read_tokens: u64,
+    #[serde(rename = "totalTokens")]
+    pub total_tokens: u64,
+    #[serde(rename = "totalCost", serialize_with = "js_number")]
+    pub total_cost: f64,
+    #[serde(rename = "modelsUsed")]
+    pub models_used: Vec<String>,
+    #[serde(rename = "modelBreakdowns")]
+    pub model_breakdowns: Vec<ModelBreakdown>,
+}
+
+/// Output shape used when `--instances` is set AND any data has a project — mirrors
+/// upstream `{projects: groupByProject(dailyData), totals}`. The `projects` field is
+/// a JS plain object (insertion-ordered keys), serialized here via `IndexMap`.
+#[derive(Debug, Serialize)]
+pub(crate) struct DailyByProjectOutput {
+    pub projects: indexmap::IndexMap<String, Vec<ProjectDailyEntry>>,
+    pub totals: Totals,
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct MonthlyOutput {
     pub monthly: Vec<MonthlyEntry>,
+    pub totals: Totals,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct WeeklyOutput {
+    pub weekly: Vec<WeeklyEntry>,
     pub totals: Totals,
 }
 
@@ -195,4 +258,31 @@ pub(crate) struct BlockEntry {
 #[derive(Debug, Serialize)]
 pub(crate) struct BlocksOutput {
     pub blocks: Vec<BlockEntry>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct SessionByIdEntry {
+    pub timestamp: String,
+    #[serde(rename = "inputTokens")]
+    pub input_tokens: u64,
+    #[serde(rename = "outputTokens")]
+    pub output_tokens: u64,
+    #[serde(rename = "cacheCreationTokens")]
+    pub cache_creation_tokens: u64,
+    #[serde(rename = "cacheReadTokens")]
+    pub cache_read_tokens: u64,
+    pub model: String,
+    #[serde(rename = "costUSD", serialize_with = "js_number")]
+    pub cost_usd: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct SessionByIdOutput {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(rename = "totalCost", serialize_with = "js_number")]
+    pub total_cost: f64,
+    #[serde(rename = "totalTokens")]
+    pub total_tokens: u64,
+    pub entries: Vec<SessionByIdEntry>,
 }

@@ -1,6 +1,7 @@
 pub(crate) mod aggregations;
 pub mod cli;
 pub(crate) mod discover;
+pub(crate) mod jq;
 pub(crate) mod output;
 pub(crate) mod parse;
 pub(crate) mod pricing;

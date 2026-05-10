@@ -117,14 +117,9 @@ pub(crate) fn build(session_id: &str, opts: &LoadOptions) -> Result<Option<Sessi
                     c
                 } else {
                     match (&message.model, fetcher.as_ref()) {
-                        (Some(m), Some(f)) => f.calculate_cost(
-                            m,
-                            input,
-                            output,
-                            cache_create,
-                            cache_read,
-                            speed_fast,
-                        ),
+                        (Some(m), Some(f)) => {
+                            f.calculate_cost(m, input, output, cache_create, cache_read, speed_fast)
+                        }
                         _ => 0.0,
                     }
                 }

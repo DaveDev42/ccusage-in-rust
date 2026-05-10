@@ -2,10 +2,10 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
+use crate::aggregations::weekly::WeekStartDay;
 use crate::aggregations::{
     LoadOptions, SortOrder as AggSortOrder, blocks, daily, monthly, session, session_by_id, weekly,
 };
-use crate::aggregations::weekly::WeekStartDay;
 use crate::jq;
 use crate::output::table;
 use crate::pricing::CostMode;
@@ -84,7 +84,12 @@ pub struct SharedArgs {
     pub id: Option<String>,
 
     /// Day to start the week on (weekly subcommand only)
-    #[arg(long = "start-of-week", short = 'w', default_value = "sunday", value_enum)]
+    #[arg(
+        long = "start-of-week",
+        short = 'w',
+        default_value = "sunday",
+        value_enum
+    )]
     pub start_of_week: CliWeekStartDay,
 
     /// jq filter expression — forces JSON mode and pipes output through `jq`
@@ -333,11 +338,17 @@ fn parse_now_override(s: &str) -> Result<chrono::DateTime<chrono::Utc>> {
         .map_err(|e| anyhow::anyhow!("invalid --now {s:?}: {e}"))
 }
 
-fn group_daily_by_project(out: crate::output::json::DailyOutput) -> crate::output::json::DailyByProjectOutput {
+fn group_daily_by_project(
+    out: crate::output::json::DailyOutput,
+) -> crate::output::json::DailyByProjectOutput {
     use crate::output::json::{DailyByProjectOutput, ProjectDailyEntry};
-    let mut projects: indexmap::IndexMap<String, Vec<ProjectDailyEntry>> = indexmap::IndexMap::new();
+    let mut projects: indexmap::IndexMap<String, Vec<ProjectDailyEntry>> =
+        indexmap::IndexMap::new();
     for entry in out.daily {
-        let project_name = entry.project.clone().unwrap_or_else(|| "unknown".to_string());
+        let project_name = entry
+            .project
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
         let pde = ProjectDailyEntry {
             date: entry.date,
             input_tokens: entry.input_tokens,

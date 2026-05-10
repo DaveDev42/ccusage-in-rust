@@ -144,8 +144,11 @@ pub(crate) fn build(opts: &LoadOptions) -> Result<SessionOutput> {
         });
     }
 
-    // Upstream session command strips the `order` arg and falls through to sortByDate's
-    // default of `desc`, so session output is always desc regardless of `--order`.
+    // Upstream `commands/session.ts` strips the `order` arg before delegating to
+    // `loadSessionData`, so its `sortByDate` defaults to `desc`. The CLI never
+    // honors `--order` for `session` — replicate that for parity. (The library
+    // function `loadSessionData` itself does honor `order`, but ccusage-rs is a
+    // CLI drop-in, not a library port.)
     entries.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
 
     let mut totals = Totals {

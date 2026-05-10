@@ -61,17 +61,14 @@ pub(crate) fn get_date_week(date_ymd: &str, start_day: u32, system_tz: Tz) -> Op
     let local_dow = local.weekday().num_days_from_sunday();
     let shift = (local_dow + 7 - start_day) % 7;
     // d.setDate(d.getDate() - shift) — reduce LOCAL date by `shift` days, keep local time-of-day.
-    let new_local_naive = local.date_naive().checked_sub_signed(
-        chrono::Duration::try_days(shift as i64)?,
-    )?.and_hms_opt(local.hour(), local.minute(), local.second())?;
+    let new_local_naive = local
+        .date_naive()
+        .checked_sub_signed(chrono::Duration::try_days(shift as i64)?)?
+        .and_hms_opt(local.hour(), local.minute(), local.second())?;
     let new_local = system_tz
         .from_local_datetime(&new_local_naive)
         .single()
-        .or_else(|| {
-            system_tz
-                .from_local_datetime(&new_local_naive)
-                .earliest()
-        })?;
+        .or_else(|| system_tz.from_local_datetime(&new_local_naive).earliest())?;
     // Back to ISO UTC, slice 0..10.
     let new_utc = new_local.with_timezone(&Utc);
     Some(new_utc.format("%Y-%m-%d").to_string())

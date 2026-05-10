@@ -1,0 +1,45 @@
+{
+  "sessions": [
+    {
+      "sessionId": "abc-session-id",
+      "inputTokens": 825,
+      "outputTokens": 1180,
+      "cacheCreationTokens": 150,
+      "cacheReadTokens": 7500,
+      "totalTokens": 9655,
+      "totalCost": 0.029212500000000002,
+      "lastActivity": "2026-04-14",
+      "modelsUsed": [
+        "claude-opus-4-6",
+        "claude-sonnet-4-5"
+      ],
+      "modelBreakdowns": [
+        {
+          "modelName": "claude-opus-4-6",
+          "inputTokens": 250,
+          "outputTokens": 500,
+          "cacheCreationTokens": 50,
+          "cacheReadTokens": 3000,
+          "cost": 0.015562500000000002
+        },
+        {
+          "modelName": "claude-sonnet-4-5",
+          "inputTokens": 575,
+          "outputTokens": 680,
+          "cacheCreationTokens": 100,
+          "cacheReadTokens": 4500,
+          "cost": 0.01365
+        }
+      ],
+      "projectPath": "-Users-dave-test-project"
+    }
+  ],
+  "totals": {
+    "inputTokens": 825,
+    "outputTokens": 1180,
+    "cacheCreationTokens": 150,
+    "cacheReadTokens": 7500,
+    "totalCost": 0.029212500000000002,
+    "totalTokens": 9655
+  }
+}

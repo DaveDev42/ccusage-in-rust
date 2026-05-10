@@ -1,0 +1,69 @@
+{
+  "sessions": [
+    {
+      "sessionId": "sess-2",
+      "inputTokens": 1050,
+      "outputTokens": 2075,
+      "cacheCreationTokens": 300,
+      "cacheReadTokens": 4600,
+      "totalTokens": 8025,
+      "totalCost": 0.06130000000000001,
+      "lastActivity": "2026-04-16",
+      "modelsUsed": [
+        "claude-opus-4-6"
+      ],
+      "modelBreakdowns": [
+        {
+          "modelName": "claude-opus-4-6",
+          "inputTokens": 1050,
+          "outputTokens": 2075,
+          "cacheCreationTokens": 300,
+          "cacheReadTokens": 4600,
+          "cost": 0.06130000000000001
+        }
+      ],
+      "projectPath": "-Users-dave-bar"
+    },
+    {
+      "sessionId": "sess-1",
+      "inputTokens": 600,
+      "outputTokens": 650,
+      "cacheCreationTokens": 50,
+      "cacheReadTokens": 1700,
+      "totalTokens": 3000,
+      "totalCost": 0.0157475,
+      "lastActivity": "2026-04-15",
+      "modelsUsed": [
+        "claude-opus-4-6",
+        "claude-sonnet-4-5"
+      ],
+      "modelBreakdowns": [
+        {
+          "modelName": "claude-opus-4-6",
+          "inputTokens": 200,
+          "outputTokens": 300,
+          "cacheCreationTokens": 0,
+          "cacheReadTokens": 500,
+          "cost": 0.00875
+        },
+        {
+          "modelName": "claude-sonnet-4-5",
+          "inputTokens": 400,
+          "outputTokens": 350,
+          "cacheCreationTokens": 50,
+          "cacheReadTokens": 1200,
+          "cost": 0.006997500000000001
+        }
+      ],
+      "projectPath": "-Users-dave-foo"
+    }
+  ],
+  "totals": {
+    "inputTokens": 1650,
+    "outputTokens": 2725,
+    "cacheCreationTokens": 350,
+    "cacheReadTokens": 6300,
+    "totalCost": 0.0770475,
+    "totalTokens": 11025
+  }
+}

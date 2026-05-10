@@ -1,0 +1,43 @@
+{
+  "monthly": [
+    {
+      "month": "2026-04",
+      "inputTokens": 1650,
+      "outputTokens": 2725,
+      "cacheCreationTokens": 350,
+      "cacheReadTokens": 6300,
+      "totalTokens": 11025,
+      "totalCost": 0.0770475,
+      "modelsUsed": [
+        "claude-opus-4-6",
+        "claude-sonnet-4-5"
+      ],
+      "modelBreakdowns": [
+        {
+          "modelName": "claude-opus-4-6",
+          "inputTokens": 1250,
+          "outputTokens": 2375,
+          "cacheCreationTokens": 300,
+          "cacheReadTokens": 5100,
+          "cost": 0.07005
+        },
+        {
+          "modelName": "claude-sonnet-4-5",
+          "inputTokens": 400,
+          "outputTokens": 350,
+          "cacheCreationTokens": 50,
+          "cacheReadTokens": 1200,
+          "cost": 0.006997500000000001
+        }
+      ]
+    }
+  ],
+  "totals": {
+    "inputTokens": 1650,
+    "outputTokens": 2725,
+    "cacheCreationTokens": 350,
+    "cacheReadTokens": 6300,
+    "totalCost": 0.0770475,
+    "totalTokens": 11025
+  }
+}

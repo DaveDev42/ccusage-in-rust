@@ -1,0 +1,9 @@
+binary	cmd	peak_rss_kb
+node	daily	4461568
+rust	daily	484672
+node	monthly	3913600
+rust	monthly	483856
+node	session	2097600
+rust	session	482800
+node	blocks	2136464
+rust	blocks	485040

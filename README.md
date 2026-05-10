@@ -10,6 +10,8 @@ v1 covers the four main commands: `daily`, `monthly`, `session`, `blocks`. Outpu
 
 Not yet ported: `--id` session lookup, weekly/yearly buckets, `--jq`, table compact mode, debug/mismatch reporting.
 
+On a 2.8 GB / 7 002 jsonl real workload (Apple M1 Max), ccusage-rs runs **5–9× faster** with **8–9× less peak memory** than upstream ccusage. See [`bench/RESULTS.md`](bench/RESULTS.md) for the methodology and raw numbers.
+
 ## Install
 
 ```sh

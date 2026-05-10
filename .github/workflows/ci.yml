@@ -49,25 +49,19 @@ jobs:
     needs: test
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-      - name: Install ccusage (pinned)
-        run: npm i -g ccusage@18.0.11
-      - run: cargo build --release
-      - name: Live parity diff
-        run: |
-          set -euo pipefail
-          for fixture in tests/fixtures/*/; do
-            name="$(basename "$fixture")"
-            for cmd in daily monthly session blocks; do
-              for order in desc asc; do
-                diff <(CLAUDE_CONFIG_DIR="$PWD/$fixture" ccusage "$cmd" --json --timezone Asia/Seoul --offline --order "$order" | jq -S .) \
-                     <(CLAUDE_CONFIG_DIR="$PWD/$fixture" ./target/release/ccusage-rs "$cmd" --json --timezone Asia/Seoul --offline --order "$order" | jq -S .) \
-                  || { echo "PARITY FAILED: $name $cmd $order"; exit 1; }
-              done
-            done
-          done
-          echo "All parity diffs clean."
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - name: Build ccusage-rs
+        run: cargo build --release
+      - name: Run parity test suite
+        env:
+          TZ: UTC
+        run: tests/parity/run.sh

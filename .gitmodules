@@ -1,0 +1,7 @@
+[submodule "third_party/ccusage"]
+	path = third_party/ccusage
+	url = https://github.com/ryoppippi/ccusage.git
+	branch = main
+	# tests/parity/run.sh writes _parity-rs.test.ts and pnpm install artifacts
+	# into the submodule working tree; ignore those for `git status` cleanliness.
+	ignore = dirty

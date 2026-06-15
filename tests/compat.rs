@@ -33,8 +33,14 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 fn run(fixture_name: &str, cmd: &str, order: &str) -> String {
+    // Each invocation gets its own throwaway cache dir so the tests (a) never touch the
+    // real ~/Library/Caches cache and (b) never contend on a shared cache.duckdb lock
+    // when cargo runs them in parallel. A fresh dir means every run is a cold rebuild,
+    // which still proves parity (cold == ccusage golden output).
+    let cache_dir = tempfile::tempdir().expect("tempdir");
     let out = Command::new(binary())
         .env("CLAUDE_CONFIG_DIR", fixture(fixture_name))
+        .env("CCUSAGE_RS_CACHE_DIR", cache_dir.path())
         .args([
             cmd,
             "--json",

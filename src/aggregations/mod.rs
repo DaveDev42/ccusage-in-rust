@@ -12,10 +12,9 @@ use std::collections::HashSet;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 
-use crate::discover::{
-    DiscoveredFile, claude_paths, discover_jsonl_files, extract_project_from_path,
-};
-use crate::parse::{UsageEvent, parse_file};
+use crate::cache;
+use crate::discover::{DiscoveredFile, claude_paths, discover_jsonl_files, extract_project_from_path};
+use crate::parse::UsageEvent;
 use crate::pricing::{CostMode, PricingFetcher};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,17 +56,29 @@ pub(crate) struct EventWithCost {
 }
 
 pub(crate) fn load_all_events(opts: &LoadOptions) -> Result<LoadedEvents> {
+    let dbg_time = std::env::var_os("CCUSAGE_RS_DEBUG_TIME").is_some();
+    let mut t = std::time::Instant::now();
+    // STEP 1 DISCOVER (unchanged): per-base OsStr-sorted file list, FULL scope.
     let bases = claude_paths()?;
-    let files = discover_jsonl_files(&bases);
-    let files = sort_files_by_earliest_timestamp(files);
-    // Upstream applies `filterByProject` BEFORE per-line read, so we mirror that.
-    let files: Vec<DiscoveredFile> = match &opts.project {
-        Some(target) => files
-            .into_iter()
-            .filter(|f| &extract_project_from_path(&f.path) == target)
-            .collect(),
-        None => files,
-    };
+    let discovered = discover_jsonl_files(&bases);
+    if dbg_time {
+        eprintln!("[load] discover {:?} ({} files)", t.elapsed(), discovered.len());
+        t = std::time::Instant::now();
+    }
+
+    // STEPS 2-7 in the cache layer: stat/diff/parse/upsert/order/read-back, returning
+    // the parsed events in EXACT event-arrival order (file order via the same
+    // two-phase ordering + within-file line_index = parse_file push order). The cache
+    // ALWAYS receives the FULL discovered list — the --project filter is applied in
+    // Rust at read-back (below), never by scoping the file list (which would evict
+    // the cache for files outside the project).
+    let (conn, is_read_only) = cache::open_db()?;
+    let events: Vec<UsageEvent> = cache::sync_and_load(&conn, &discovered, is_read_only)?;
+    drop(conn);
+    if dbg_time {
+        eprintln!("[load] sync_and_load {:?} ({} events)", t.elapsed(), events.len());
+        t = std::time::Instant::now();
+    }
 
     // Pricing fetcher only needed for non-display modes.
     let fetcher = if opts.mode == CostMode::Display {
@@ -76,25 +87,38 @@ pub(crate) fn load_all_events(opts: &LoadOptions) -> Result<LoadedEvents> {
         Some(PricingFetcher::load(opts.offline)?)
     };
 
+    // STEP 8 PROJECT + DEDUP + COST (faithful port of the old load_all_events tail).
+    // Apply --project at the FILE level (matches today's pre-parse file filter), then
+    // run the shared cross-file dedup over the ordered stream, then compute cost.
     let mut seen: HashSet<String> = HashSet::new();
-    let mut events: Vec<UsageEvent> = Vec::new();
-
-    for f in &files {
-        let _ = parse_file(&f.path, &f.base_dir, &mut seen, &mut events);
+    let mut with_costs: Vec<EventWithCost> = Vec::new();
+    for e in events {
+        // FILE-level project filter (mirrors the old `filterByProject` over files).
+        if let Some(target) = &opts.project {
+            if &extract_project_from_path(&e.source_file) != target {
+                continue;
+            }
+        }
+        // Cross-file dedup: first-occurrence-in-global-order wins. Only lines with
+        // BOTH message.id AND requestId participate (dedup_key NULL otherwise).
+        if let (Some(mid), Some(rid)) = (e.msg_id.as_ref(), e.request_id.as_ref()) {
+            let key = format!("{mid}:{rid}");
+            if !seen.insert(key) {
+                continue;
+            }
+        }
+        let cost = compute_cost(&e, opts.mode, fetcher.as_ref());
+        let project = extract_project_from_path(&e.source_file);
+        with_costs.push(EventWithCost {
+            event: e,
+            cost,
+            project,
+        });
     }
 
-    let with_costs: Vec<EventWithCost> = events
-        .into_iter()
-        .map(|e| {
-            let cost = compute_cost(&e, opts.mode, fetcher.as_ref());
-            let project = extract_project_from_path(&e.source_file);
-            EventWithCost {
-                event: e,
-                cost,
-                project,
-            }
-        })
-        .collect();
+    if dbg_time {
+        eprintln!("[load] dedup+cost {:?} ({} kept)", t.elapsed(), with_costs.len());
+    }
 
     Ok(LoadedEvents { events: with_costs })
 }
@@ -132,10 +156,8 @@ fn compute_cost(event: &UsageEvent, mode: CostMode, fetcher: Option<&PricingFetc
     }
 }
 
+#[allow(dead_code)]
 fn sort_files_by_earliest_timestamp(mut files: Vec<DiscoveredFile>) -> Vec<DiscoveredFile> {
-    use std::fs::File;
-    use std::io::{BufRead, BufReader};
-
     let mut keyed: Vec<(Option<DateTime<Utc>>, DiscoveredFile)> = files
         .drain(..)
         .map(|f| {
@@ -144,43 +166,62 @@ fn sort_files_by_earliest_timestamp(mut files: Vec<DiscoveredFile>) -> Vec<Disco
         })
         .collect();
 
-    keyed.sort_by(|a, b| match (&a.0, &b.0) {
+    keyed.sort_by(|a, b| file_order_cmp(&a.0, &b.0));
+
+    keyed.into_iter().map(|(_, f)| f).collect()
+}
+
+/// SSOT file-order comparator (phase-2 of the two-phase order). Reused by `cache.rs`
+/// so the cached read-back reproduces the exact same global earliest-ts sort.
+/// Both `Some` -> compare instants; `None` (no parseable timestamp) sorts LAST;
+/// `Equal` for the both-`None` / equal-instant case (stable tie-break preserves the
+/// pre-sort per-base OsStr order).
+pub(crate) fn file_order_cmp(
+    a: &Option<DateTime<Utc>>,
+    b: &Option<DateTime<Utc>>,
+) -> std::cmp::Ordering {
+    match (a, b) {
         (Some(x), Some(y)) => x.cmp(y),
         (None, None) => std::cmp::Ordering::Equal,
         (None, _) => std::cmp::Ordering::Greater,
         (_, None) => std::cmp::Ordering::Less,
-    });
+    }
+}
 
-    return keyed.into_iter().map(|(_, f)| f).collect();
+/// All-lines earliest timestamp of a JSONL file. Reads EVERY line's `timestamp`
+/// field — including lines that `parse_file` rejects (no usage, etc.) — so the file
+/// sort key is identical to a pure timestamp scan. Promoted to top-level so both the
+/// non-cache path and `cache.rs` call the IDENTICAL function.
+pub(crate) fn earliest_timestamp(path: &std::path::Path) -> Option<DateTime<Utc>> {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
 
-    fn earliest_timestamp(path: &std::path::Path) -> Option<DateTime<Utc>> {
-        let f = File::open(path).ok()?;
-        let r = BufReader::new(f);
-        let mut earliest: Option<DateTime<Utc>> = None;
-        for line in r.lines().map_while(Result::ok) {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            #[derive(serde::Deserialize)]
-            struct Tsl {
-                timestamp: Option<String>,
-            }
-            if let Ok(parsed) = serde_json::from_str::<Tsl>(trimmed) {
-                if let Some(s) = parsed.timestamp {
-                    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&s) {
-                        let dt_utc = dt.with_timezone(&Utc);
-                        earliest = match earliest {
-                            None => Some(dt_utc),
-                            Some(prev) if dt_utc < prev => Some(dt_utc),
-                            other => other,
-                        };
-                    }
+    let f = File::open(path).ok()?;
+    let r = BufReader::new(f);
+    let mut earliest: Option<DateTime<Utc>> = None;
+    for line in r.lines().map_while(Result::ok) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        #[derive(serde::Deserialize)]
+        struct Tsl {
+            timestamp: Option<String>,
+        }
+        if let Ok(parsed) = serde_json::from_str::<Tsl>(trimmed) {
+            if let Some(s) = parsed.timestamp {
+                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&s) {
+                    let dt_utc = dt.with_timezone(&Utc);
+                    earliest = match earliest {
+                        None => Some(dt_utc),
+                        Some(prev) if dt_utc < prev => Some(dt_utc),
+                        other => other,
+                    };
                 }
             }
         }
-        earliest
     }
+    earliest
 }
 
 /// Filter a YYYY-MM-DD or YYYY-MM string by ccusage's date filter rules

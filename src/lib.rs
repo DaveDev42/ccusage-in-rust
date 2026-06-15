@@ -1,4 +1,5 @@
 pub(crate) mod aggregations;
+pub(crate) mod cache;
 pub mod cli;
 pub(crate) mod discover;
 pub(crate) mod jq;

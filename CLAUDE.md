@@ -59,7 +59,8 @@ The pipeline is **discover → parse → cost → aggregate → render**, and ea
 src/
 ├── cli.rs              clap definitions for all subcommands + flag-to-LoadOptions translation
 ├── discover.rs         CLAUDE_CONFIG_DIR resolution, jsonl walk, project-name extraction
-├── parse.rs            jsonl line → UsageEvent, with dedup by (message.id, requestId)
+├── parse.rs            jsonl line → UsageEvent, with INTRA-file dedup by (message.id, requestId)
+├── cache.rs            embedded-DuckDB incremental parsed-row cache + file manifest (I/O only)
 ├── pricing.rs          LiteLLM pricing fetch (live → disk cache → bundled), cost calculation
 ├── timezone.rs         IANA tz handling, ts parsing, YYYY-MM-DD bucketing
 ├── jq.rs               --jq passthrough (shells out to system jq)
@@ -78,12 +79,24 @@ src/
 
 Key invariants to preserve when modifying:
 
-- **Dedup happens once, globally**, in `parse_file` via the shared `seen: HashSet<String>` keyed by `messageId:requestId`. Files are sorted by earliest timestamp first so the first occurrence of a duplicate wins (matches upstream).
+- **Dedup happens once, globally**, keyed by `messageId:requestId`, with first-occurrence-in-global-order winning (matches upstream). Files are sorted by earliest timestamp first. As of the DuckDB cache, dedup is split: `parse_file` keeps an INTRA-file throwaway `HashSet` (so same-file dups drop at parse time, order-independent and safe to cache), and the CROSS-file dedup is replayed in `aggregations::load_all_events` over the ordered read-back with the shared `seen: HashSet<String>`. Net outcome is identical to the old single shared HashSet across the file loop.
 - **Filter order matters**: project filter → file walk → per-line parse → dedup → cost compute → date filter → aggregate. Reordering changes results because date filtering applies to the aggregation key (e.g. `last_activity` for sessions), not the raw event timestamp.
 - **`--mode` controls the cost source**: `display` reads `costUSD` from the line and never calls the pricer; `calculate` always recomputes from tokens; `auto` (default) prefers `costUSD`, falls back to recompute.
 - **Synthetic models** (e.g. `<synthetic>`) are excluded from `models_used` and breakdowns but their tokens still count toward totals.
 - **`session.rs` hardcodes desc order** even though the shared `--order` flag exists. This is intentional CLI parity — upstream's `commands/session.ts` strips `order` before delegating, so the CLI form always sorts desc. The library function honors `order`, but we are a CLI drop-in. Don't "fix" this without checking the upstream `commands/*.ts` thin wrappers.
 - **Blocks projection requires a deterministic `now`** — `--now <ISO8601>` or `CCUSAGE_RS_NOW` overrides wall-clock so tests/benches can be reproducible.
+
+## Incremental cache (`cache.rs`)
+
+`load_all_events`'s file loop is backed by an embedded DuckDB at `$CCUSAGE_RS_CACHE_DIR/cache.duckdb` (default `dirs::cache_dir()/ccusage-rs/cache.duckdb`). DuckDB is **purely an I/O cache** — it stores the parsed rows `parse_file` emits (PRE cross-file-dedup, PRE cost) plus a `(path, mtime_ns, size_bytes, earliest_ts, schema_version)` manifest. **No SQL aggregation, SUM, or GROUP BY ever runs against it.** All aggregation, float-sum, dedup, cost, model ordering, and JSON serialization stay 100% Rust-native, so output is byte-identical to the non-cached path (proven by the cold/warm/touch matrix in `tests/cache.rs` + the real-pool harness).
+
+Per run: discover (full file list, never project-filtered) → stat → diff vs manifest → rayon-parse only CHANGED/NEW files (`parse_file` + the promoted top-level `earliest_timestamp`) → per-file INDIVIDUAL transaction upsert (DuckDB has NO SAVEPOINT) → reconstruct the exact two-phase file order in Rust (per-base OsStr from `discover_jsonl_files`, then `file_order_cmp` over cached `earliest_ts` — never SQL `ORDER BY`) → ONE bulk `SELECT * FROM messages`, ordered in Rust by `(file_position, line_index)`. The `--project`/`--instances` filter is applied in Rust at read-back, never by scoping the discovered file list (that would evict the cache). DELETED is scoped to this run's bases.
+
+Invariants:
+- **`SCHEMA_VERSION` is a compile-time FNV-1a hash of `src/parse.rs` + `src/cache.rs`** (emitted by `build.rs` as `CCUSAGE_RS_SCHEMA_VERSION`, masked to 63 bits → fits `BIGINT`). Any edit to the parsed-row emission re-classifies every manifest row as CHANGED → full reparse. No human step. (This is why editing `cache.rs` invalidates an existing cache — expected.)
+- **`ts` is a DuckDB `TIMESTAMP`** (micros), round-tripping `DateTime<Utc>` losslessly; all output instants still flow through `blocks.rs::iso_string()` (`%.3fZ`). No raw-string timestamp column. `session_by_id.rs` is NOT cache-backed (keeps its raw-string `timestamp` and no-dedup semantics — unchanged).
+- **`open_db` tries read-write; on a file-lock conflict it falls back to read-only** (serve warm state, skip ingest), and if even read-only is blocked it uses an ephemeral in-memory DB (correct, unpersisted — never deletes a locked file). Non-lock open failure (corruption / on-disk format change, guarded by the `meta.duckdb_crate_version` marker) → delete + cold rebuild.
+- **Escape hatches**: `CCUSAGE_RS_FORCE_RESCAN=1` treats all files as CHANGED; deleting `cache.duckdb` cold-rebuilds. `CCUSAGE_RS_DEBUG_TIME=1` prints per-phase timings to stderr (never affects stdout). Deleting the cache does NOT reset `litellm.json` (pricing) — costs after a cold rebuild match the current pricing snapshot, same non-determinism as today under live pricing.
 
 ## Testing strategy
 

@@ -24,6 +24,11 @@ iana-time-zone = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 comfy-table = "7"
 dirs = "5"
+# Embedded incremental parsed-row cache + file manifest. `bundled` compiles DuckDB's
+# C++ amalgamation from source via the cc crate (no system libduckdb, no runtime dylib;
+# fully static). First clean build is a one-time ~4-7min C++ compile; ~4s incremental
+# relink once libduckdb-sys' object is cached. Binary grows ~7MB -> ~42MB; +~269 lock pkgs.
+duckdb = { version = "1", features = ["bundled"] }
 indexmap = { version = "2", features = ["serde"] }
 rayon = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }

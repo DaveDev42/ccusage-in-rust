@@ -62,6 +62,11 @@ pub(crate) struct UsageEvent {
     pub cost_usd: Option<f64>,
     pub source_file: PathBuf,
     pub source_base: PathBuf,
+    /// Raw `message.id` (dedup component). Persisted so the cache read-back path can
+    /// rebuild `dedup_key` for the cross-file dedup replay in `aggregations::mod`.
+    pub msg_id: Option<String>,
+    /// Raw `requestId` (dedup component).
+    pub request_id: Option<String>,
 }
 
 pub(crate) fn parse_file(
@@ -120,6 +125,9 @@ pub(crate) fn parse_file(
                 continue;
             }
         }
+        // Capture dedup components for the cache (no behavioral change to parse output).
+        let msg_id = message.id.clone();
+        let request_id = raw.request_id.clone();
 
         let speed_fast = speed_value == Some("fast");
         let display_model = message.model.as_deref().map(|m| {
@@ -142,6 +150,8 @@ pub(crate) fn parse_file(
             cost_usd: raw.cost_usd,
             source_file: path.to_path_buf(),
             source_base: base_dir.to_path_buf(),
+            msg_id,
+            request_id,
         });
     }
     Ok(())

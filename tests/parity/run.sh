@@ -42,6 +42,22 @@ if [[ ! -x "$RUST_BIN" ]]; then
   (cd "$REPO_ROOT" && cargo build --release)
 fi
 
+# Isolate the cache DB, and serialize the test files. Both are load-bearing.
+#
+# Without this every one of the 62 cases shares the developer's REAL
+# ~/Library/Caches/ccusage-rs/cache.duckdb, and vitest runs the two test files in
+# parallel. The second ccusage-rs process then cannot take the write lock, falls
+# back to read-only (by design — see the open strategy in src/cache.rs), and serves
+# a warm state that holds nothing for that case's fresh fixture tempdir. The case
+# sees `[]` and fails. Measured flake: 2/62 to 10/62 failures per run, and it
+# reproduces on older binaries too, so a failure here was never evidence about the
+# change under test. Serialized + isolated it is 62/62 repeatably.
+#
+# The isolation also keeps the suite from leaving fixture-tempdir rows behind in the
+# real cache, which is exactly the orphan accumulation retention has to clean up.
 echo "[parity] running vitest"
 cd "$CCUSAGE_APP"
-TZ=UTC RUST_BIN="$RUST_BIN" pnpm exec vitest run src/_parity-rs.test.ts
+PARITY_CACHE_DIR="$(mktemp -d)"
+trap 'rm -rf "$PARITY_CACHE_DIR"' EXIT
+TZ=UTC RUST_BIN="$RUST_BIN" CCUSAGE_RS_CACHE_DIR="$PARITY_CACHE_DIR" \
+  pnpm exec vitest run src/_parity-rs.test.ts --no-file-parallelism

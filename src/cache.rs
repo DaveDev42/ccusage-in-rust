@@ -50,7 +50,10 @@ const fn parse_i64(s: &str) -> i64 {
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
-        assert!(b >= b'0' && b <= b'9', "CCUSAGE_RS_SCHEMA_VERSION must be decimal");
+        assert!(
+            b >= b'0' && b <= b'9',
+            "CCUSAGE_RS_SCHEMA_VERSION must be decimal"
+        );
         acc = acc * 10 + (b - b'0') as i64;
         i += 1;
     }
@@ -73,6 +76,64 @@ fn cache_db_path() -> Result<PathBuf> {
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("creating cache dir {}", dir.display()))?;
     Ok(dir.join("cache.duckdb"))
+}
+
+/// DuckDB's buffer-pool budget defaults to **80% of physical RAM**, which is a bad
+/// fit for this cache. `sync_and_load` step 7 scans the ENTIRE `messages` table on
+/// every run (it filters to this run's in-scope paths in Rust, not in SQL), so the
+/// pool genuinely gets used: on the 8 GB always-on hub, 80% is ~6.4 GiB, and a single
+/// run was measured holding 2.14 GiB resident against a 5.5 GB cache file. Cap the
+/// pool and let DuckDB spill to `temp_directory` rather than compete with the rest of
+/// the machine. Bounded-and-slower beats unbounded-and-swapping.
+///
+/// Override with `CCUSAGE_RS_MEMORY_LIMIT` using DuckDB size syntax (e.g. `256MB`).
+const DEFAULT_MEMORY_LIMIT: &str = "1GB";
+
+/// The configured pool ceiling. A malformed override degrades to the default instead
+/// of turning every invocation into a hard open error.
+fn memory_limit() -> String {
+    let Some(raw) = std::env::var_os("CCUSAGE_RS_MEMORY_LIMIT") else {
+        return DEFAULT_MEMORY_LIMIT.to_string();
+    };
+    let raw = raw.to_string_lossy().trim().to_string();
+    if is_valid_size(&raw) {
+        raw
+    } else {
+        DEFAULT_MEMORY_LIMIT.to_string()
+    }
+}
+
+/// `<digits>[.<digits>][unit]` where unit is a DuckDB byte unit (or absent).
+fn is_valid_size(s: &str) -> bool {
+    let split = s
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(s.len());
+    let (num, unit) = s.split_at(split);
+    if num.is_empty()
+        || num.matches('.').count() > 1
+        || !num.ends_with(|c: char| c.is_ascii_digit())
+    {
+        return false;
+    }
+    matches!(
+        unit.trim().to_ascii_uppercase().as_str(),
+        "" | "B" | "KB" | "MB" | "GB" | "TB" | "KIB" | "MIB" | "GIB" | "TIB"
+    )
+}
+
+/// Config shared by every open path. Passing the limit at open time (rather than a
+/// later `SET`) means it also applies to the read-only fallback, where the connection
+/// is handed straight to the read-back. `temp_dir` is where DuckDB spills once the
+/// capped pool is exhausted; pass `None` when we have no writable directory.
+fn db_config(access: Option<AccessMode>, temp_dir: Option<&Path>) -> Result<Config> {
+    let mut cfg = Config::default().max_memory(&memory_limit())?;
+    if let Some(mode) = access {
+        cfg = cfg.access_mode(mode)?;
+    }
+    if let Some(dir) = temp_dir {
+        cfg = cfg.with("temp_directory", path_to_str(dir))?;
+    }
+    Ok(cfg)
 }
 
 const CREATE_DDL: &str = "
@@ -128,7 +189,7 @@ pub(crate) fn open_db() -> Result<(Connection, bool)> {
     // 1. read-write. (Connection::open takes the file lock, so if it succeeds we hold
     // it and ensure_schema cannot hit a lock error — any ensure_schema failure is a
     // schema/format problem -> cold rebuild.)
-    match Connection::open(&path) {
+    match Connection::open_with_flags(&path, db_config(None, path.parent())?) {
         Ok(conn) => match ensure_schema(&conn) {
             Ok(()) => Ok((conn, false)),
             Err(_) => {
@@ -150,7 +211,7 @@ pub(crate) fn open_db() -> Result<(Connection, bool)> {
 /// File is locked by a concurrent RW holder. Try read-only; if even RO is blocked,
 /// use an ephemeral in-memory DB (full cold parse, correct output, no persistence).
 fn open_locked_fallback(path: &Path) -> Result<(Connection, bool)> {
-    let cfg = Config::default().access_mode(AccessMode::ReadOnly)?;
+    let cfg = db_config(Some(AccessMode::ReadOnly), path.parent())?;
     match Connection::open_with_flags(path, cfg) {
         Ok(conn) => {
             // Read-only: serve the warm state. (If incompatible we still serve RO; the
@@ -158,8 +219,10 @@ fn open_locked_fallback(path: &Path) -> Result<(Connection, bool)> {
             Ok((conn, true))
         }
         Err(_) => {
-            // Locked for RO too -> ephemeral in-memory RW (correct, unpersisted).
-            let conn = Connection::open_in_memory()
+            // Locked for RO too -> ephemeral in-memory RW (correct, unpersisted). This is
+            // the hungriest path of all — a full cold parse with nothing on disk to page
+            // against — so it needs the cap at least as much as the others.
+            let conn = Connection::open_in_memory_with_flags(db_config(None, path.parent())?)
                 .context("opening in-memory fallback cache")?;
             ensure_schema(&conn)?;
             Ok((conn, false))
@@ -177,14 +240,15 @@ fn recreate_from_scratch(path: &Path) -> Result<(Connection, bool)> {
     let _ = std::fs::remove_file(path);
     // DuckDB also writes a WAL sidecar.
     let _ = std::fs::remove_file(path.with_extension("duckdb.wal"));
-    match Connection::open(path) {
+    match Connection::open_with_flags(path, db_config(None, path.parent())?) {
         Ok(conn) => {
             ensure_schema(&conn)?;
             Ok((conn, false))
         }
         Err(_) => {
-            // Even a fresh on-disk open failed (path unwritable, etc.) -> in-memory.
-            let conn = Connection::open_in_memory()
+            // Even a fresh on-disk open failed (path unwritable, etc.) -> in-memory. The
+            // cache dir is evidently not usable here, so don't point temp_directory at it.
+            let conn = Connection::open_in_memory_with_flags(db_config(None, None)?)
                 .context("opening in-memory cache after on-disk reset failed")?;
             ensure_schema(&conn)?;
             Ok((conn, false))
@@ -325,8 +389,9 @@ pub(crate) fn sync_and_load(
     }
     let mut manifest: HashMap<String, ManifestRow> = HashMap::new();
     {
-        let mut stmt = conn
-            .prepare("SELECT path, base_dir, mtime_ns, size_bytes, schema_version FROM file_manifest")?;
+        let mut stmt = conn.prepare(
+            "SELECT path, base_dir, mtime_ns, size_bytes, schema_version FROM file_manifest",
+        )?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -399,10 +464,11 @@ pub(crate) fn sync_and_load(
         let parsed: Vec<ParsedFile> = changed
             .par_iter()
             .map(|f| {
-                let (mtime_ns, size_bytes, _) = stats
-                    .get(&f.path)
-                    .cloned()
-                    .unwrap_or((0, 0, f.base_dir.clone()));
+                let (mtime_ns, size_bytes, _) =
+                    stats
+                        .get(&f.path)
+                        .cloned()
+                        .unwrap_or((0, 0, f.base_dir.clone()));
                 let mut events: Vec<UsageEvent> = Vec::new();
                 let mut throwaway: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
@@ -428,6 +494,19 @@ pub(crate) fn sync_and_load(
         }
         for pf in &parsed {
             upsert_file(conn, pf)?;
+        }
+
+        // RETENTION: reclaim rows for files that are gone for good, including those
+        // under bases this invocation never discovered (the DELETED pass above is
+        // scope-limited and cannot see them). Runs before steps 6-7, so the read-back
+        // scan below immediately benefits. Timer-gated — see orphan_sweep_due.
+        let now_unix = unix_now();
+        if orphan_sweep_due(conn, now_unix) {
+            let removed = sweep_orphans(conn)?;
+            write_meta(conn, ORPHAN_SWEEP_KEY, &now_unix.to_string())?;
+            if dbg_time {
+                eprintln!("[cache] orphan sweep: removed {removed} vanished file(s)");
+            }
         }
     }
 
@@ -557,6 +636,79 @@ fn upsert_delete(conn: &Connection, path: &str) -> Result<()> {
     }
 }
 
+/// The sweep stats every manifest row, so it is timer-gated rather than per-run.
+const ORPHAN_SWEEP_INTERVAL_SECS: i64 = 24 * 60 * 60;
+const ORPHAN_SWEEP_KEY: &str = "last_orphan_sweep_unix";
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Due when we have never swept, when the stamp is unreadable or in the future, or
+/// when the interval has elapsed. `CCUSAGE_RS_FORCE_ORPHAN_SWEEP` forces one.
+fn orphan_sweep_due(conn: &Connection, now: i64) -> bool {
+    if std::env::var_os("CCUSAGE_RS_FORCE_ORPHAN_SWEEP").is_some() {
+        return true;
+    }
+    match read_meta(conn, ORPHAN_SWEEP_KEY).and_then(|v| v.parse::<i64>().ok()) {
+        // A stamp in the FUTURE — clock skew, a corrupted value, a machine that ran
+        // with a bad RTC — must not wedge the sweep off until real time catches up, so
+        // treat it as due and let the re-stamp heal it. (Note signed `saturating_sub`
+        // saturates at i64::MIN, not 0, so the elapsed test alone would read "not due"
+        // forever.)
+        Some(last) => last > now || now.saturating_sub(last) >= ORPHAN_SWEEP_INTERVAL_SECS,
+        None => true,
+    }
+}
+
+/// Retention: drop manifest + message rows whose source file no longer exists.
+///
+/// Why this is needed on top of the per-run DELETED pass: step 3 only evicts files
+/// under bases THIS run discovered (`scope_bases`), because absence from
+/// `discovered_set` cannot distinguish "deleted" from "this invocation never looked
+/// there". So anything under a base a given command does not touch — a retired profile
+/// dir, a host whose synced transcripts were pruned, a renamed project — stays cached
+/// forever. And because step 7 scans the WHOLE `messages` table, those dead rows cost
+/// memory and time on every later run. On the 8 GB hub that is how `cache.duckdb`
+/// reached 5.5 GB.
+///
+/// PARITY: this removes only rows whose file is gone from disk. Upstream globs the
+/// live tree, so a vanished file contributes nothing there either, and step 7 already
+/// restricts the read-back to this run's in-scope paths. Reported output is unchanged;
+/// this reclaims space, it does not change what we report.
+///
+/// The existence test uses the same lossy string the manifest is keyed by, so a
+/// non-UTF-8 path can read as absent and be evicted. That is self-correcting — it is
+/// simply re-parsed on the next run — at worst once per sweep interval.
+fn sweep_orphans(conn: &Connection) -> Result<usize> {
+    let mut paths: Vec<String> = Vec::new();
+    {
+        let mut stmt = conn.prepare("SELECT path FROM file_manifest")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        for row in rows {
+            paths.push(row?);
+        }
+    }
+    let mut removed = 0usize;
+    for p in &paths {
+        if !Path::new(p).exists() {
+            // Reuse the per-file transaction: messages + manifest go together or not
+            // at all, so an interrupted sweep can never orphan rows the other way.
+            upsert_delete(conn, p)?;
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        // DuckDB reuses freed blocks rather than truncating, so the file will NOT
+        // shrink on disk; CHECKPOINT flushes the WAL so the space becomes reusable.
+        conn.execute_batch("CHECKPOINT;")?;
+    }
+    Ok(removed)
+}
+
 /// One transaction: re-ingest a single file (delete old rows, insert new, upsert
 /// manifest). On parse failure, leave the manifest row STALE (so it stays CHANGED
 /// next run) but ALSO clear its message rows so we never serve stale rows mixed with
@@ -578,7 +730,11 @@ fn upsert_file(conn: &Connection, pf: &ParsedFile) -> Result<()> {
                 "INSERT OR REPLACE INTO file_manifest \
                  (path, base_dir, mtime_ns, size_bytes, earliest_ts, schema_version, ingested_at) \
                  VALUES (?, ?, -1, -1, NULL, ?, current_localtimestamp())",
-                duckdb::params![path.as_str(), path_to_str(&pf.base_dir).as_str(), SCHEMA_VERSION],
+                duckdb::params![
+                    path.as_str(),
+                    path_to_str(&pf.base_dir).as_str(),
+                    SCHEMA_VERSION
+                ],
             )?;
             Ok(())
         })();
@@ -602,11 +758,10 @@ fn upsert_file(conn: &Connection, pf: &ParsedFile) -> Result<()> {
         {
             let mut app = conn.appender("messages")?;
             for (idx, ev) in pf.events.iter().enumerate() {
-                let dedup_key: Option<String> =
-                    match (ev.msg_id.as_ref(), ev.request_id.as_ref()) {
-                        (Some(mid), Some(rid)) => Some(format!("{mid}:{rid}")),
-                        _ => None,
-                    };
+                let dedup_key: Option<String> = match (ev.msg_id.as_ref(), ev.request_id.as_ref()) {
+                    (Some(mid), Some(rid)) => Some(format!("{mid}:{rid}")),
+                    _ => None,
+                };
                 app.append_row(duckdb::params![
                     path.as_str(),
                     idx as i32,
@@ -709,6 +864,189 @@ mod tests {
         conn
     }
 
+    /// Parse DuckDB's own rendering of a byte setting ("1.0 GiB", "953.7 MiB", ...).
+    fn parse_bytes(s: &str) -> f64 {
+        let num: String = s
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        let v: f64 = num.parse().unwrap_or(f64::MAX);
+        let mult = match s[num.len()..].trim().to_ascii_uppercase().as_str() {
+            "B" => 1.0,
+            "KIB" => 1024.0,
+            "MIB" => 1024f64.powi(2),
+            "GIB" => 1024f64.powi(3),
+            "TIB" => 1024f64.powi(4),
+            "KB" => 1e3,
+            "MB" => 1e6,
+            "GB" => 1e9,
+            "TB" => 1e12,
+            _ => f64::MAX,
+        };
+        v * mult
+    }
+
+    /// EMPIRICAL VALIDATION: the pool cap must actually reach DuckDB. If this
+    /// regresses, every invocation silently returns to the 80%-of-physical-RAM default
+    /// (~6.4 GiB on the 8 GB hub) that contributed to taking that box down.
+    #[test]
+    fn memory_limit_reaches_the_connection() {
+        let conn = Connection::open_in_memory_with_flags(db_config(None, None).unwrap()).unwrap();
+        let got: String = conn
+            .query_row("SELECT current_setting('memory_limit')", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            parse_bytes(&got) <= 1.2e9,
+            "memory_limit not applied: DuckDB reports {got}"
+        );
+    }
+
+    /// The read-only fallback is the path that runs while ANOTHER process holds the
+    /// write lock — i.e. two ccusage-rs processes resident at once, exactly the case
+    /// where an uncapped pool hurts most. Asserts the claim made in `db_config`: the
+    /// cap is applied at open time, so it survives `AccessMode::ReadOnly` (where a
+    /// later `SET memory_limit` is not something we can rely on).
+    #[test]
+    fn memory_limit_applies_to_the_read_only_connection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("cache.duckdb");
+        {
+            let conn = Connection::open_with_flags(&db, db_config(None, Some(tmp.path())).unwrap())
+                .unwrap();
+            ensure_schema(&conn).unwrap();
+        }
+        let ro = Connection::open_with_flags(
+            &db,
+            db_config(Some(AccessMode::ReadOnly), Some(tmp.path())).unwrap(),
+        )
+        .unwrap();
+        let got: String = ro
+            .query_row("SELECT current_setting('memory_limit')", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            parse_bytes(&got) <= 1.2e9,
+            "read-only connection left uncapped: DuckDB reports {got}"
+        );
+    }
+
+    /// A typo'd override must degrade to the default, not make every run fail to open.
+    #[test]
+    fn size_validation_rejects_junk() {
+        for good in ["1GB", "256MB", "512 MiB", "1.5GB", "1024"] {
+            assert!(is_valid_size(good), "{good} should be accepted");
+        }
+        for bad in [
+            "",
+            "lots",
+            "GB",
+            "1PB",
+            "1GB; DROP TABLE messages",
+            "-1GB",
+            "1.2.3GB",
+        ] {
+            assert!(!is_valid_size(bad), "{bad} should be rejected");
+        }
+    }
+
+    /// The retention guarantee: a file that is GONE loses its rows *and* its manifest
+    /// entry (or it would never be re-parsed), while a file still on disk is untouched
+    /// — that second half is what keeps output bit-exact.
+    #[test]
+    fn orphan_sweep_evicts_only_vanished_files() {
+        let conn = mem_db();
+        let tmp = tempfile::tempdir().unwrap();
+        let live = tmp.path().join("live.jsonl");
+        std::fs::write(&live, "{}\n").unwrap();
+        let gone = tmp.path().join("gone.jsonl"); // deliberately never created
+
+        for (p, n) in [(&live, 2i32), (&gone, 3i32)] {
+            let ps = path_to_str(p);
+            conn.execute(
+                "INSERT INTO file_manifest \
+                 (path, base_dir, mtime_ns, size_bytes, earliest_ts, schema_version, ingested_at) \
+                 VALUES (?, ?, 1, 1, NULL, ?, current_localtimestamp())",
+                duckdb::params![ps.as_str(), "/base", SCHEMA_VERSION],
+            )
+            .unwrap();
+            {
+                let mut app = conn.appender("messages").unwrap();
+                for i in 0..n {
+                    app.append_row(duckdb::params![
+                        ps.as_str(),
+                        i,
+                        Value::Timestamp(TimeUnit::Microsecond, 1_000_000),
+                        Option::<&str>::None,
+                        Option::<&str>::None,
+                        1u64,
+                        1u64,
+                        0u64,
+                        0u64,
+                        false,
+                        Option::<f64>::None,
+                        Option::<&str>::None,
+                        Option::<&str>::None,
+                        Option::<&str>::None,
+                        "/base",
+                    ])
+                    .unwrap();
+                }
+                app.flush().unwrap();
+            }
+        }
+
+        assert_eq!(sweep_orphans(&conn).unwrap(), 1);
+
+        let count = |sql: &str, p: &Path| -> i64 {
+            conn.query_row(sql, [path_to_str(p).as_str()], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(
+            count("SELECT COUNT(*) FROM messages WHERE path = ?", &live),
+            2,
+            "rows for a file still on disk must survive — this is the parity guarantee"
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM messages WHERE path = ?", &gone),
+            0
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM file_manifest WHERE path = ?", &gone),
+            0,
+            "manifest must go with the messages, else the file is never re-parsed"
+        );
+    }
+
+    /// Sweeping stats every manifest row, so it must not run on every invocation.
+    #[test]
+    fn orphan_sweep_is_timer_gated() {
+        if std::env::var_os("CCUSAGE_RS_FORCE_ORPHAN_SWEEP").is_some() {
+            return; // forced in this environment; the gate is bypassed by design
+        }
+        let conn = mem_db();
+        let now = unix_now();
+        assert!(
+            orphan_sweep_due(&conn, now),
+            "a never-swept DB must sweep once"
+        );
+        write_meta(&conn, ORPHAN_SWEEP_KEY, &now.to_string()).unwrap();
+        assert!(
+            !orphan_sweep_due(&conn, now),
+            "must not sweep again immediately"
+        );
+        assert!(orphan_sweep_due(&conn, now + ORPHAN_SWEEP_INTERVAL_SECS));
+
+        // A future stamp must not wedge the sweep off permanently.
+        write_meta(&conn, ORPHAN_SWEEP_KEY, &(now + 86_400_000).to_string()).unwrap();
+        assert!(
+            orphan_sweep_due(&conn, now),
+            "a stamp in the future must re-sweep and re-stamp, not disable the sweep"
+        );
+
+        // An unparseable stamp sweeps rather than silently never running again.
+        write_meta(&conn, ORPHAN_SWEEP_KEY, "not-a-number").unwrap();
+        assert!(orphan_sweep_due(&conn, now));
+    }
+
     /// EMPIRICAL VALIDATION (per ops-lens correction): does `ROLLBACK` undo rows
     /// inserted via the Appender inside a manual transaction? The whole per-file
     /// atomicity design depends on YES. If this ever fails, the Appender must be
@@ -743,7 +1081,10 @@ mod tests {
         let n: i64 = conn
             .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(n, 0, "Appender rows survived ROLLBACK -> per-file txn isolation is broken");
+        assert_eq!(
+            n, 0,
+            "Appender rows survived ROLLBACK -> per-file txn isolation is broken"
+        );
     }
 
     /// Per-file COMMIT persists; a separate file's ROLLBACK leaves the first intact.
@@ -756,10 +1097,21 @@ mod tests {
             let mut app = conn.appender("messages").unwrap();
             for i in 0..2i32 {
                 app.append_row(duckdb::params![
-                    "/a.jsonl", i, Value::Timestamp(TimeUnit::Microsecond, 1_000_000),
-                    Option::<&str>::None, Option::<&str>::None,
-                    1u64, 1u64, 0u64, 0u64, false, Option::<f64>::None,
-                    Option::<&str>::None, Option::<&str>::None, Option::<&str>::None, "/p",
+                    "/a.jsonl",
+                    i,
+                    Value::Timestamp(TimeUnit::Microsecond, 1_000_000),
+                    Option::<&str>::None,
+                    Option::<&str>::None,
+                    1u64,
+                    1u64,
+                    0u64,
+                    0u64,
+                    false,
+                    Option::<f64>::None,
+                    Option::<&str>::None,
+                    Option::<&str>::None,
+                    Option::<&str>::None,
+                    "/p",
                 ])
                 .unwrap();
             }
@@ -772,10 +1124,21 @@ mod tests {
         {
             let mut app = conn.appender("messages").unwrap();
             app.append_row(duckdb::params![
-                "/b.jsonl", 0i32, Value::Timestamp(TimeUnit::Microsecond, 2_000_000),
-                Option::<&str>::None, Option::<&str>::None,
-                5u64, 5u64, 0u64, 0u64, false, Option::<f64>::None,
-                Option::<&str>::None, Option::<&str>::None, Option::<&str>::None, "/p",
+                "/b.jsonl",
+                0i32,
+                Value::Timestamp(TimeUnit::Microsecond, 2_000_000),
+                Option::<&str>::None,
+                Option::<&str>::None,
+                5u64,
+                5u64,
+                0u64,
+                0u64,
+                false,
+                Option::<f64>::None,
+                Option::<&str>::None,
+                Option::<&str>::None,
+                Option::<&str>::None,
+                "/p",
             ])
             .unwrap();
             app.flush().unwrap();
@@ -783,10 +1146,18 @@ mod tests {
         conn.execute_batch("ROLLBACK;").unwrap();
 
         let a: i64 = conn
-            .query_row("SELECT COUNT(*) FROM messages WHERE path = '/a.jsonl'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE path = '/a.jsonl'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         let b: i64 = conn
-            .query_row("SELECT COUNT(*) FROM messages WHERE path = '/b.jsonl'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE path = '/b.jsonl'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(a, 2);
         assert_eq!(b, 0);
@@ -849,19 +1220,28 @@ mod tests {
         let ev1 = sync_and_load(&conn, &discovered, false).unwrap();
         assert_eq!(ev1.len(), 1);
         let ingested_1: i64 = conn
-            .query_row("SELECT COUNT(*) FROM file_manifest WHERE schema_version = ?", duckdb::params![SCHEMA_VERSION], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM file_manifest WHERE schema_version = ?",
+                duckdb::params![SCHEMA_VERSION],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(ingested_1, 1);
 
         // Make the manifest schema_version stale.
-        conn.execute("UPDATE file_manifest SET schema_version = 1", []).unwrap();
+        conn.execute("UPDATE file_manifest SET schema_version = 1", [])
+            .unwrap();
 
         // Re-sync: the stale row must be re-classified CHANGED and re-parsed back to
         // the current SCHEMA_VERSION.
         let ev2 = sync_and_load(&conn, &discovered, false).unwrap();
         assert_eq!(ev2.len(), 1);
         let restamped: i64 = conn
-            .query_row("SELECT COUNT(*) FROM file_manifest WHERE schema_version = ?", duckdb::params![SCHEMA_VERSION], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM file_manifest WHERE schema_version = ?",
+                duckdb::params![SCHEMA_VERSION],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(restamped, 1, "stale schema_version row was not re-parsed");
     }
@@ -879,17 +1259,30 @@ mod tests {
         let db = base_b.join("projects/-p/s");
         std::fs::create_dir_all(&da).unwrap();
         std::fs::create_dir_all(&db).unwrap();
-        let dup = concat!(r#"{"type":"assistant","timestamp":"2026-04-12T08:00:00.000Z","requestId":"r1","message":{"id":"m1","model":"x","usage":{"input_tokens":1,"output_tokens":2}}}"#, "\n");
+        let dup = concat!(
+            r#"{"type":"assistant","timestamp":"2026-04-12T08:00:00.000Z","requestId":"r1","message":{"id":"m1","model":"x","usage":{"input_tokens":1,"output_tokens":2}}}"#,
+            "\n"
+        );
         std::fs::write(da.join("t.jsonl"), dup).unwrap();
         std::fs::write(db.join("t.jsonl"), dup).unwrap();
 
         let discovered = vec![
-            DiscoveredFile { path: da.join("t.jsonl"), base_dir: base_a.join("projects") },
-            DiscoveredFile { path: db.join("t.jsonl"), base_dir: base_b.join("projects") },
+            DiscoveredFile {
+                path: da.join("t.jsonl"),
+                base_dir: base_a.join("projects"),
+            },
+            DiscoveredFile {
+                path: db.join("t.jsonl"),
+                base_dir: base_b.join("projects"),
+            },
         ];
         let conn = mem_db();
         let evs = sync_and_load(&conn, &discovered, false).unwrap();
-        assert_eq!(evs.len(), 2, "both cross-base copies must be cached (dedup is downstream)");
+        assert_eq!(
+            evs.len(),
+            2,
+            "both cross-base copies must be cached (dedup is downstream)"
+        );
         // Both have the same dedup components.
         for e in &evs {
             assert_eq!(e.msg_id.as_deref(), Some("m1"));
@@ -918,7 +1311,9 @@ mod tests {
         // Read-only on an EMPTY db: must skip ingest, return nothing.
         let evs = sync_and_load(&conn, &discovered, true).unwrap();
         assert_eq!(evs.len(), 0, "read-only mode must not ingest");
-        let n: i64 = conn.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0)).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(n, 0);
 
         // Now write (read-write), then read-only serves the warm state.

@@ -15,10 +15,17 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CCUSAGE_RS_OFFLINE_BUILD");
 
     // ---- Compile-time schema-version hash ----
-    // Any edit to the parsed-row emission (src/parse.rs) or the cache column layout
-    // (src/cache.rs) changes this hash, which classifies every cached manifest row as
-    // CHANGED -> a full re-parse. Eliminates the hand-maintained-int forget hazard.
+    // Hashes src/parse.rs (which decides the row VALUES) plus the marker-delimited row
+    // contract in src/cache.rs (which decides the row SHAPE and the field<->column
+    // mapping). A change to either classifies every cached manifest row as CHANGED -> a
+    // full re-parse, so it eliminates the hand-maintained-int forget hazard.
     // Masked to 63 bits so it fits DuckDB's signed BIGINT (and Rust's i64 SCHEMA_VERSION).
+    //
+    // It deliberately does NOT hash all of cache.rs. That was the original design and it
+    // was far too broad: a comment or an added helper invalidated every cached row, which
+    // on the 8 GB hub means re-reading ~9.6 GiB of JSONL across ~29k files for a change
+    // that cannot affect a single stored byte. Measured: a pure retention/memory patch
+    // triggered exactly that.
     emit_schema_version(&manifest_dir);
 
     let offline = env::var("CCUSAGE_RS_OFFLINE_BUILD").is_ok();
@@ -51,14 +58,20 @@ fn emit_schema_version(manifest_dir: &Path) {
     println!("cargo:rerun-if-changed=src/parse.rs");
     println!("cargo:rerun-if-changed=src/cache.rs");
 
-    // FNV-1a over the concatenated source bytes of both files.
+    // FNV-1a over parse.rs in full, then only the row-contract regions of cache.rs.
+    // Both reads panic on failure: silently hashing nothing would leave the guard
+    // vacuous, which is worse than a broken build (stale rows would be served as fresh).
+    let parse_src = fs::read(&parse_rs)
+        .unwrap_or_else(|e| panic!("schema hash: cannot read {}: {e}", parse_rs.display()));
+    let cache_src = fs::read_to_string(&cache_rs)
+        .unwrap_or_else(|e| panic!("schema hash: cannot read {}: {e}", cache_rs.display()));
+    let contract = extract_row_contract(&cache_src, &cache_rs);
+
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for p in [&parse_rs, &cache_rs] {
-        if let Ok(bytes) = fs::read(p) {
-            for b in bytes {
-                hash ^= b as u64;
-                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-            }
+    for bytes in [parse_src.as_slice(), contract.as_bytes()] {
+        for b in bytes {
+            hash ^= *b as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
     }
     // Mask to 63 bits -> always fits signed i64 / DuckDB BIGINT.
@@ -71,6 +84,73 @@ fn emit_schema_version(manifest_dir: &Path) {
     let duckdb_ver = resolve_duckdb_version(manifest_dir).unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rerun-if-changed=Cargo.lock");
     println!("cargo:rustc-env=CCUSAGE_RS_DUCKDB_VERSION={duckdb_ver}");
+}
+
+const HASH_BEGIN: &str = "SCHEMA-HASH-BEGIN";
+const HASH_END: &str = "SCHEMA-HASH-END";
+
+/// Collect the marker-delimited "row contract" regions of cache.rs, in file order.
+///
+/// A region must enclose anything that decides what a stored row MEANS: the table DDL,
+/// the writer's positional column list, and the reader's column list plus its index
+/// mapping. Anything outside the markers — helpers, logging, retention, tests, prose —
+/// cannot invalidate a cached row and so must not churn the hash.
+///
+/// Marker lines themselves are excluded, so relabelling a region is free. The bytes
+/// INSIDE a region are hashed verbatim, comments included: keep explanation outside the
+/// markers, because editing a comment within one costs every machine a full re-parse.
+///
+/// Every failure mode panics rather than degrading. An empty contract would silently
+/// weaken the guard to "parse.rs only", and a stale row served as fresh is a wrong
+/// answer, which is strictly worse than a build that stops.
+fn extract_row_contract(src: &str, path: &Path) -> String {
+    let mut out = String::new();
+    let mut open = false;
+    let mut regions = 0usize;
+
+    for (n, line) in src.lines().enumerate() {
+        let lineno = n + 1;
+        if line.contains(HASH_BEGIN) {
+            if open {
+                panic!(
+                    "schema hash: nested {HASH_BEGIN} at {}:{lineno}",
+                    path.display()
+                );
+            }
+            open = true;
+            regions += 1;
+            continue;
+        }
+        if line.contains(HASH_END) {
+            if !open {
+                panic!(
+                    "schema hash: unmatched {HASH_END} at {}:{lineno}",
+                    path.display()
+                );
+            }
+            open = false;
+            continue;
+        }
+        if open {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+
+    if open {
+        panic!(
+            "schema hash: unterminated {HASH_BEGIN} in {}",
+            path.display()
+        );
+    }
+    if regions == 0 || out.trim().is_empty() {
+        panic!(
+            "schema hash: no row-contract regions found in {} — the cache-invalidation \
+             guard would be vacuous, so refusing to build",
+            path.display()
+        );
+    }
+    out
 }
 
 /// Best-effort: extract the resolved `duckdb` version from Cargo.lock.

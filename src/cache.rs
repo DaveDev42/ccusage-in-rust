@@ -136,6 +136,20 @@ fn db_config(access: Option<AccessMode>, temp_dir: Option<&Path>) -> Result<Conf
     Ok(cfg)
 }
 
+// The regions between the build.rs marker pair are the ROW CONTRACT: they decide what a
+// stored row means, and their bytes are hashed into SCHEMA_VERSION. Editing one — even a
+// comment inside it — classifies every cached row as CHANGED, which on the 8 GB hub means
+// re-reading ~9.6 GiB of JSONL. Keep prose and unrelated code outside them.
+/// Read-back column list. Its ORDER is the contract the `r.get(N)` indices below depend
+/// on, which is why it lives in the hash while the surrounding statement text does not:
+/// adding a WHERE clause changes the query but not what a stored row means.
+// SCHEMA-HASH-BEGIN messages-read-columns
+const MESSAGES_READ_COLUMNS: &str = "path, line_index, ts, model, display_model, \
+     input_tokens, output_tokens, cache_creation, cache_read, speed_fast, cost_usd, \
+     msg_id, request_id, base_dir";
+// SCHEMA-HASH-END
+
+// SCHEMA-HASH-BEGIN table-ddl
 const CREATE_DDL: &str = "
 CREATE TABLE IF NOT EXISTS meta (
   key   VARCHAR PRIMARY KEY,
@@ -170,6 +184,7 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS idx_messages_path ON messages(path);
 ";
+// SCHEMA-HASH-END
 
 /// Open the cache DB. Returns `(connection, is_read_only)`.
 ///
@@ -565,16 +580,13 @@ pub(crate) fn sync_and_load(
     // We include line_index in the SELECT and sort the materialized Vec.
     let mut rows: Vec<(usize, i32, UsageEvent)> = Vec::new();
     {
-        let mut stmt = conn.prepare(
-            "SELECT path, line_index, ts, model, display_model, input_tokens, output_tokens, \
-             cache_creation, cache_read, speed_fast, cost_usd, msg_id, request_id, base_dir \
-             FROM messages",
-        )?;
+        let mut stmt = conn.prepare(&format!("SELECT {MESSAGES_READ_COLUMNS} FROM messages"))?;
         let mut q = stmt.query([])?;
         while let Some(r) = q.next()? {
             let path: String = r.get(0)?;
             // Skip rows whose file isn't in this run's ordered scope (out-of-scope base).
             let Some(&p) = pos.get(&path) else { continue };
+            // SCHEMA-HASH-BEGIN messages-read-map
             let line_index: i32 = r.get(1)?;
             let ts_micros: i64 = ts_i64_from_row(r, 2)?;
             let model: Option<String> = r.get(3)?;
@@ -604,6 +616,7 @@ pub(crate) fn sync_and_load(
                 msg_id,
                 request_id,
             };
+            // SCHEMA-HASH-END
             rows.push((p, line_index, event));
         }
     }
@@ -726,6 +739,7 @@ fn upsert_file(conn: &Connection, pf: &ParsedFile) -> Result<()> {
             // Set manifest to a sentinel that never matches a real stat, ensuring
             // re-attempt, and earliest_ts = NULL (sorts last) so any prior cached
             // ordering value is not reused. Keep base_dir for scoping.
+            // SCHEMA-HASH-BEGIN manifest-write-parse-failed
             conn.execute(
                 "INSERT OR REPLACE INTO file_manifest \
                  (path, base_dir, mtime_ns, size_bytes, earliest_ts, schema_version, ingested_at) \
@@ -736,6 +750,7 @@ fn upsert_file(conn: &Connection, pf: &ParsedFile) -> Result<()> {
                     SCHEMA_VERSION
                 ],
             )?;
+            // SCHEMA-HASH-END
             Ok(())
         })();
         return match res {
@@ -756,6 +771,7 @@ fn upsert_file(conn: &Connection, pf: &ParsedFile) -> Result<()> {
 
         // Bulk insert via Appender (transactional in duckdb 1.4.x — verified).
         {
+            // SCHEMA-HASH-BEGIN messages-write
             let mut app = conn.appender("messages")?;
             for (idx, ev) in pf.events.iter().enumerate() {
                 let dedup_key: Option<String> = match (ev.msg_id.as_ref(), ev.request_id.as_ref()) {
@@ -781,8 +797,10 @@ fn upsert_file(conn: &Connection, pf: &ParsedFile) -> Result<()> {
                 ])?;
             }
             app.flush()?;
+            // SCHEMA-HASH-END
         }
 
+        // SCHEMA-HASH-BEGIN manifest-write
         let earliest = pf
             .earliest_ts
             .map(|dt| Value::Timestamp(TimeUnit::Microsecond, dt_to_micros(dt)));
@@ -799,6 +817,7 @@ fn upsert_file(conn: &Connection, pf: &ParsedFile) -> Result<()> {
                 SCHEMA_VERSION,
             ],
         )?;
+        // SCHEMA-HASH-END
         Ok(())
     })();
 

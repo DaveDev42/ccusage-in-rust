@@ -13,7 +13,9 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 
 use crate::cache;
-use crate::discover::{DiscoveredFile, claude_paths, discover_jsonl_files, extract_project_from_path};
+use crate::discover::{
+    DiscoveredFile, claude_paths, discover_jsonl_files, extract_project_from_path,
+};
 use crate::parse::UsageEvent;
 use crate::pricing::{CostMode, PricingFetcher};
 
@@ -62,7 +64,11 @@ pub(crate) fn load_all_events(opts: &LoadOptions) -> Result<LoadedEvents> {
     let bases = claude_paths()?;
     let discovered = discover_jsonl_files(&bases);
     if dbg_time {
-        eprintln!("[load] discover {:?} ({} files)", t.elapsed(), discovered.len());
+        eprintln!(
+            "[load] discover {:?} ({} files)",
+            t.elapsed(),
+            discovered.len()
+        );
         t = std::time::Instant::now();
     }
 
@@ -76,7 +82,11 @@ pub(crate) fn load_all_events(opts: &LoadOptions) -> Result<LoadedEvents> {
     let events: Vec<UsageEvent> = cache::sync_and_load(&conn, &discovered, is_read_only)?;
     drop(conn);
     if dbg_time {
-        eprintln!("[load] sync_and_load {:?} ({} events)", t.elapsed(), events.len());
+        eprintln!(
+            "[load] sync_and_load {:?} ({} events)",
+            t.elapsed(),
+            events.len()
+        );
         t = std::time::Instant::now();
     }
 
@@ -117,7 +127,11 @@ pub(crate) fn load_all_events(opts: &LoadOptions) -> Result<LoadedEvents> {
     }
 
     if dbg_time {
-        eprintln!("[load] dedup+cost {:?} ({} kept)", t.elapsed(), with_costs.len());
+        eprintln!(
+            "[load] dedup+cost {:?} ({} kept)",
+            t.elapsed(),
+            with_costs.len()
+        );
     }
 
     Ok(LoadedEvents { events: with_costs })

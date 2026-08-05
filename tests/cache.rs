@@ -16,7 +16,11 @@ use std::process::Command;
 fn binary() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.push("target");
-    p.push(if cfg!(debug_assertions) { "debug" } else { "release" });
+    p.push(if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    });
     p.push("ccusage-rs");
     p
 }
@@ -97,17 +101,92 @@ fn cold_warm_touch_byte_identical() {
     let multi = format!("{},{}", base_a.display(), base_b.display());
 
     let matrices: Vec<Vec<&str>> = vec![
-        vec!["daily", "--json", "--offline", "--order", "asc", "--timezone", "Asia/Seoul"],
-        vec!["daily", "--json", "--offline", "--order", "desc", "--timezone", "Asia/Seoul"],
-        vec!["daily", "--json", "--offline", "--mode", "calculate", "--order", "asc", "--timezone", "UTC"],
-        vec!["daily", "--json", "--offline", "--mode", "display", "--order", "asc", "--timezone", "UTC"],
-        vec!["daily", "--json", "--offline", "--instances", "--order", "asc"],
-        vec!["daily", "--json", "--offline", "--since", "20260413", "--order", "asc"],
-        vec!["daily", "--json", "--offline", "--until", "20260413", "--order", "asc"],
-        vec!["monthly", "--json", "--offline", "--order", "asc", "--timezone", "Asia/Seoul"],
+        vec![
+            "daily",
+            "--json",
+            "--offline",
+            "--order",
+            "asc",
+            "--timezone",
+            "Asia/Seoul",
+        ],
+        vec![
+            "daily",
+            "--json",
+            "--offline",
+            "--order",
+            "desc",
+            "--timezone",
+            "Asia/Seoul",
+        ],
+        vec![
+            "daily",
+            "--json",
+            "--offline",
+            "--mode",
+            "calculate",
+            "--order",
+            "asc",
+            "--timezone",
+            "UTC",
+        ],
+        vec![
+            "daily",
+            "--json",
+            "--offline",
+            "--mode",
+            "display",
+            "--order",
+            "asc",
+            "--timezone",
+            "UTC",
+        ],
+        vec![
+            "daily",
+            "--json",
+            "--offline",
+            "--instances",
+            "--order",
+            "asc",
+        ],
+        vec![
+            "daily",
+            "--json",
+            "--offline",
+            "--since",
+            "20260413",
+            "--order",
+            "asc",
+        ],
+        vec![
+            "daily",
+            "--json",
+            "--offline",
+            "--until",
+            "20260413",
+            "--order",
+            "asc",
+        ],
+        vec![
+            "monthly",
+            "--json",
+            "--offline",
+            "--order",
+            "asc",
+            "--timezone",
+            "Asia/Seoul",
+        ],
         vec!["monthly", "--json", "--offline", "--order", "desc"],
         vec!["weekly", "--json", "--offline", "--order", "asc"],
-        vec!["weekly", "--json", "--offline", "--order", "desc", "--start-of-week", "monday"],
+        vec![
+            "weekly",
+            "--json",
+            "--offline",
+            "--order",
+            "desc",
+            "--start-of-week",
+            "monday",
+        ],
         vec!["session", "--json", "--offline", "--order", "asc"],
         vec!["session", "--json", "--offline", "--order", "desc"],
         vec!["blocks", "--json", "--offline", "--order", "asc"],
@@ -148,16 +227,35 @@ fn project_filter_does_not_evict() {
 
     // Reference full-run output (fresh cache).
     let ref_dir = tempfile::tempdir().unwrap();
-    let full_ref = run(ref_dir.path(), &multi, &["daily", "--json", "--offline", "--order", "asc"]);
+    let full_ref = run(
+        ref_dir.path(),
+        &multi,
+        &["daily", "--json", "--offline", "--order", "asc"],
+    );
 
     // Prime full, then run a project-scoped query, then full again.
-    let full_1 = run(warm_dir.path(), &multi, &["daily", "--json", "--offline", "--order", "asc"]);
+    let full_1 = run(
+        warm_dir.path(),
+        &multi,
+        &["daily", "--json", "--offline", "--order", "asc"],
+    );
     let _proj = run(
         warm_dir.path(),
         &multi,
-        &["daily", "--json", "--offline", "--order", "asc", "--project=-Users-dave-alpha"],
+        &[
+            "daily",
+            "--json",
+            "--offline",
+            "--order",
+            "asc",
+            "--project=-Users-dave-alpha",
+        ],
     );
-    let full_2 = run(warm_dir.path(), &multi, &["daily", "--json", "--offline", "--order", "asc"]);
+    let full_2 = run(
+        warm_dir.path(),
+        &multi,
+        &["daily", "--json", "--offline", "--order", "asc"],
+    );
 
     assert_eq!(full_ref, full_1, "primed full != fresh full");
     assert_eq!(full_1, full_2, "--project run evicted/changed the cache");
@@ -173,18 +271,33 @@ fn scoped_base_does_not_delete_out_of_scope() {
 
     let warm_dir = tempfile::tempdir().unwrap();
     let ref_dir = tempfile::tempdir().unwrap();
-    let full_ref = run(ref_dir.path(), &multi, &["daily", "--json", "--offline", "--order", "asc"]);
+    let full_ref = run(
+        ref_dir.path(),
+        &multi,
+        &["daily", "--json", "--offline", "--order", "asc"],
+    );
 
     // Prime full, then a baseA-only run (baseB out of scope), then full again.
-    let _ = run(warm_dir.path(), &multi, &["daily", "--json", "--offline", "--order", "asc"]);
+    let _ = run(
+        warm_dir.path(),
+        &multi,
+        &["daily", "--json", "--offline", "--order", "asc"],
+    );
     let _ = run(
         warm_dir.path(),
         &base_a.display().to_string(),
         &["daily", "--json", "--offline", "--order", "asc"],
     );
-    let full_after = run(warm_dir.path(), &multi, &["daily", "--json", "--offline", "--order", "asc"]);
+    let full_after = run(
+        warm_dir.path(),
+        &multi,
+        &["daily", "--json", "--offline", "--order", "asc"],
+    );
 
-    assert_eq!(full_ref, full_after, "scoped-base run deleted out-of-scope rows");
+    assert_eq!(
+        full_ref, full_after,
+        "scoped-base run deleted out-of-scope rows"
+    );
 }
 
 /// Read-only fallback: open a read-write connection to the warm cache, hold it, then
@@ -201,11 +314,23 @@ fn warm_read_matches_cold() {
     let multi = format!("{},{}", base_a.display(), base_b.display());
 
     let cold_dir = tempfile::tempdir().unwrap();
-    let cold = run(cold_dir.path(), &multi, &["session", "--json", "--offline", "--order", "desc"]);
+    let cold = run(
+        cold_dir.path(),
+        &multi,
+        &["session", "--json", "--offline", "--order", "desc"],
+    );
 
     let warm_dir = tempfile::tempdir().unwrap();
-    let _ = run(warm_dir.path(), &multi, &["session", "--json", "--offline", "--order", "desc"]);
-    let warm = run(warm_dir.path(), &multi, &["session", "--json", "--offline", "--order", "desc"]);
+    let _ = run(
+        warm_dir.path(),
+        &multi,
+        &["session", "--json", "--offline", "--order", "desc"],
+    );
+    let warm = run(
+        warm_dir.path(),
+        &multi,
+        &["session", "--json", "--offline", "--order", "desc"],
+    );
 
     assert_eq!(cold, warm);
 }

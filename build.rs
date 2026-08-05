@@ -84,7 +84,11 @@ fn resolve_duckdb_version(manifest_dir: &Path) -> Option<String> {
         } else if t == "name = \"duckdb\"" {
             in_duckdb = true;
         } else if in_duckdb && t.starts_with("version = ") {
-            return Some(t.trim_start_matches("version = ").trim_matches('"').to_string());
+            return Some(
+                t.trim_start_matches("version = ")
+                    .trim_matches('"')
+                    .to_string(),
+            );
         }
     }
     None

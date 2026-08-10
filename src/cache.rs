@@ -536,18 +536,22 @@ pub(crate) fn sync_and_load(
     // stable sort) reuses file_order_cmp. We build the ordered path list from the
     // DISCOVERED files (preserving phase-1 order) keyed to their cached earliest_ts.
 
-    // Build path -> earliest_ts map from the manifest (post-upsert).
-    let mut earliest_map: HashMap<String, Option<DateTime<Utc>>> = HashMap::new();
+    // Build path -> (earliest_ts, base_dir) from the manifest (post-upsert, so it also
+    // covers the files this run just ingested). base_dir is carried because step 7 uses
+    // it to scope the read-back; it must come from here — the STORED value — and not
+    // from this run's `scope_bases`. See the scope_dirs comment below.
+    let mut earliest_map: HashMap<String, (Option<DateTime<Utc>>, String)> = HashMap::new();
     {
-        let mut stmt = conn.prepare("SELECT path, earliest_ts FROM file_manifest")?;
+        let mut stmt = conn.prepare("SELECT path, earliest_ts, base_dir FROM file_manifest")?;
         let rows = stmt.query_map([], |r| {
             let path: String = r.get(0)?;
             let ts: Option<i64> = ts_opt_from_row(r, 1)?;
-            Ok((path, ts.map(micros_to_dt)))
+            let base_dir: String = r.get(2)?;
+            Ok((path, (ts.map(micros_to_dt), base_dir)))
         })?;
         for row in rows {
-            let (path, ts) = row?;
-            earliest_map.insert(path, ts);
+            let (path, entry) = row?;
+            earliest_map.insert(path, entry);
         }
     }
 
@@ -559,7 +563,7 @@ pub(crate) fn sync_and_load(
     let mut ordered: Vec<(PathBuf, Option<DateTime<Utc>>)> = Vec::new();
     for f in discovered {
         let key = path_to_str(&f.path);
-        if let Some(ts) = earliest_map.get(&key) {
+        if let Some((ts, _)) = earliest_map.get(&key) {
             ordered.push((f.path.clone(), *ts));
         }
     }
@@ -573,18 +577,55 @@ pub(crate) fn sync_and_load(
         pos.insert(path_to_str(p), i);
     }
 
+    // SQL pre-filter for step 7: the distinct base_dir values STORED for this run's
+    // in-scope paths. The table holds every base this machine has ever cached — retired
+    // profile dirs, a host whose synced transcripts moved, test fixtures — and a command
+    // that does not look there must not pay to ship those rows to Rust. Measured on the
+    // 8 GB hub: ~1.02M cached rows, ~796k in scope, so ~22% were transferred and
+    // immediately discarded on every run.
+    //
+    // It is derived from the manifest (the stored value), NOT from `scope_bases` (this
+    // run's discovery bases), and that distinction is the whole safety argument. An
+    // UNCHANGED file is never re-parsed, so re-shaping the caller's root list leaves its
+    // cached rows holding the OLD base_dir; a predicate built from this run's bases would
+    // then match nothing and silently drop live events. Deriving it from the manifest
+    // cannot: `messages.base_dir` and `file_manifest.base_dir` are written in the same
+    // transaction from the same ParsedFile, and every path in `pos` has a manifest row by
+    // construction (`ordered` is built from `earliest_map`), so the predicate is provably
+    // a superset of the in-scope rows. `pos` below stays the exact filter.
+    let mut seen_dirs: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut scope_dirs: Vec<String> = Vec::new();
+    for p in pos.keys() {
+        if let Some((_, base)) = earliest_map.get(p) {
+            if seen_dirs.insert(base.as_str()) {
+                scope_dirs.push(base.clone());
+            }
+        }
+    }
+
     lap!(t, "ordering");
     // ---- STEP 7: SINGLE-QUERY READ-BACK ----
-    // ONE columnar scan of all message rows. We do NOT use SQL ORDER BY for file
-    // order (collation/NULL drift); instead we order in Rust by (file_pos, line_index).
-    // We include line_index in the SELECT and sort the materialized Vec.
+    // ONE columnar scan of the in-scope message rows. We do NOT use SQL ORDER BY for
+    // file order (collation/NULL drift); instead we order in Rust by (file_pos,
+    // line_index). We include line_index in the SELECT and sort the materialized Vec.
+    //
+    // The WHERE clause is outside the SCHEMA-HASH markers on purpose: it changes which
+    // rows we ask for, never what a stored row means, so it must not invalidate a single
+    // cached row. (Empty scope -> no query at all; `IN ()` is a syntax error, and there
+    // is nothing to return anyway.)
     let mut rows: Vec<(usize, i32, UsageEvent)> = Vec::new();
-    {
-        let mut stmt = conn.prepare(&format!("SELECT {MESSAGES_READ_COLUMNS} FROM messages"))?;
-        let mut q = stmt.query([])?;
+    if !scope_dirs.is_empty() {
+        let placeholders = vec!["?"; scope_dirs.len()].join(", ");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MESSAGES_READ_COLUMNS} FROM messages WHERE base_dir IN ({placeholders})"
+        ))?;
+        let mut q = stmt.query(duckdb::params_from_iter(
+            scope_dirs.iter().map(|s| s.as_str()),
+        ))?;
         while let Some(r) = q.next()? {
             let path: String = r.get(0)?;
-            // Skip rows whose file isn't in this run's ordered scope (out-of-scope base).
+            // Skip rows whose file isn't in this run's ordered scope (a sibling path
+            // under an in-scope base that this command did not discover).
             let Some(&p) = pos.get(&path) else { continue };
             // SCHEMA-HASH-BEGIN messages-read-map
             let line_index: i32 = r.get(1)?;
@@ -619,6 +660,17 @@ pub(crate) fn sync_and_load(
             // SCHEMA-HASH-END
             rows.push((p, line_index, event));
         }
+    }
+
+    if dbg_time {
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap_or(-1);
+        eprintln!(
+            "[cache] read-back: {} row(s) kept of {total} table row(s), {} in-scope base dir(s)",
+            rows.len(),
+            scope_dirs.len()
+        );
     }
 
     // Order by (file_position, line_index) — exact event-arrival order.
@@ -1307,6 +1359,52 @@ mod tests {
             assert_eq!(e.msg_id.as_deref(), Some("m1"));
             assert_eq!(e.request_id.as_deref(), Some("r1"));
         }
+    }
+
+    /// Step 7's SQL scope must follow the base_dir the row was STORED with, not this
+    /// run's discovery bases.
+    ///
+    /// The two disagree the moment the caller re-shapes its root list: an UNCHANGED file
+    /// is never re-parsed, so its cached rows keep the old base_dir. Here the same file
+    /// is discovered first under `<tmp>/base/projects` and then under the enclosing
+    /// `<tmp>/base`. A predicate built from the second run's bases would match zero rows
+    /// and return zero events — a silent wrong answer for a caller whose only change was
+    /// how it named its roots.
+    #[test]
+    fn read_back_scope_follows_the_stored_base_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("base");
+        let dir = base.join("projects/-p/s");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("t.jsonl"),
+            concat!(r#"{"type":"assistant","timestamp":"2026-04-12T08:00:00.000Z","requestId":"r1","message":{"id":"m1","model":"x","usage":{"input_tokens":1,"output_tokens":2}}}"#, "\n"),
+        )
+        .unwrap();
+
+        let conn = mem_db();
+        let deep = vec![DiscoveredFile {
+            path: dir.join("t.jsonl"),
+            base_dir: base.join("projects"),
+        }];
+        assert_eq!(sync_and_load(&conn, &deep, false).unwrap().len(), 1);
+
+        // Same file, shallower root. Unchanged stat -> no re-parse -> stored base_dir is
+        // still `<tmp>/base/projects` while this run's scope base is `<tmp>/base`.
+        let shallow = vec![DiscoveredFile {
+            path: dir.join("t.jsonl"),
+            base_dir: base.clone(),
+        }];
+        let evs = sync_and_load(&conn, &shallow, false).unwrap();
+        assert_eq!(
+            evs.len(),
+            1,
+            "re-shaping the root list must not drop cached events"
+        );
+        // The stale stored base is still what we report. Pinned deliberately: this test
+        // is about not LOSING the row, and pre-existing source_base staleness on an
+        // unchanged file is a separate (upstream-invisible) matter.
+        assert_eq!(evs[0].source_base, base.join("projects"));
     }
 
     /// Read-only mode skips parse/upsert and serves whatever is already in the DB.
